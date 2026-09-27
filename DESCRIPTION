@@ -1,0 +1,33 @@
+Package: chat.api
+Type: Package
+Title: Transport-Agnostic Chat Contract
+Version: 0.1.0
+Date: 2026-09-11
+Authors@R: c(
+    person("Troy", "Hernandez", role = c("aut", "cre"),
+           email = "troy@cornball.ai",
+           comment = c(ORCID = "0009-0005-4248-604X")),
+    person("cornball.ai", role = "cph"))
+Description: A transport-agnostic contract for chat-room connectivity:
+    connect, poll, and send against one interface, with adapters for
+    'Matrix' <https://spec.matrix.org/>, 'Slack' <https://api.slack.com/>,
+    'Telegram' <https://core.telegram.org/bots/api>, and Internet Relay
+    Chat (IRC). An in-memory adapter supports local testing. Capability
+    flags describe support for threads, markup dialects, encryption, and
+    per-message identity. Platform clients are supplied by optional
+    packages; the core interface uses only base R.
+License: Apache License (>= 2)
+Depends: R (>= 4.0)
+URL: https://github.com/cornball-ai/chat.api
+BugReports: https://github.com/cornball-ai/chat.api/issues
+Suggests: httr, mx.api, mx.client (>= 0.2.1), mx.crypto (>= 0.2.2),
+        slackr, telegram, tinytest
+Encoding: UTF-8
+NeedsCompilation: no
+Packaged: 2026-09-15 23:19:44 UTC; troy
+Author: Troy Hernandez [aut, cre] (ORCID:
+    <https://orcid.org/0009-0005-4248-604X>),
+  cornball.ai [cph]
+Maintainer: Troy Hernandez <troy@cornball.ai>
+Repository: CRAN
+Date/Publication: 2026-09-27 15:50:02 UTC

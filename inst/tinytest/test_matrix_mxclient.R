@@ -1,0 +1,1195 @@
+# The half of the Matrix adapter that needs mx.client installed: drift
+# detection against its real signatures, the mapping run through the
+# real extractor rather than a seam, and the typing and resolve paths
+# that call into it directly. Splitting these out means the skip is
+# announced. Folded into test_matrix.R behind a bare `if`, roughly 60%
+# of the Matrix suite used to evaporate on a runner built with
+# _R_CHECK_FORCE_SUGGESTS_=false and the badge stayed green.
+
+if (!requireNamespace("mx.client", quietly = TRUE)) {
+    exit_file("mx.client not installed")
+}
+
+# Device queries use the local master even when bootstrap happens after the
+# crypto context was built. Missing/corrupt keys must never trust a server pin.
+if (requireNamespace("mx.crypto", quietly = TRUE) &&
+    utils::packageVersion("mx.crypto") >= "0.2.1.1") local({
+    store <- tempfile("pin-store-")
+    dir.create(store)
+    on.exit(unlink(store, recursive = TRUE), add = TRUE)
+    # Fixed test-only pickle key: this fixture checks save/load and pin trust,
+    # independently of mx.client's platform-specific random-byte source.
+    writeBin(as.raw(seq_len(32L)), file.path(store, "pickle.key"))
+    crypto <- list(store = store)
+    mx <- list(user_id = "@bot:example.org")
+    query <- function(client, user_ids, self_master_key) {
+        expect_identical(client, mx)
+        expect_identical(user_ids, mx$user_id)
+        list(pin = self_master_key)
+    }
+    lookup <- function() chat.api:::matrix_crypto_known_devices(
+        crypto, mx, mx$user_id, .query = query)
+    expect_null(lookup()$pin)
+    keys <- mx.client:::mx_crypto_cross_signing_new()
+    mx.client:::mx_crypto_cross_signing_save(keys, store)
+    expect_identical(lookup()$pin,
+                     mx.crypto::mxc_signing_key_public(keys$master))
+    writeLines("corrupt", file.path(store, "cross-signing.json"))
+    expect_warning(untrusted <- lookup(), "cannot load local cross-signing")
+    expect_null(untrusted$pin)
+})
+
+# ---- API drift ----
+# Membership is not enough: the adapter passes the first one or two
+# arguments positionally, so an upstream reorder would keep every name
+# present while the message body went out as the room id.
+
+sync_formals <- names(formals(mx.client::mx_sync_update))
+expect_true(all(c("client", "timeout", "save", "app", "filter") %in%
+                sync_formals))
+expect_identical(sync_formals[1L], "client")
+
+# mx_sync_update's return is what carries first_run, and a silent
+# removal is invisible at the call site: isTRUE(NULL) is FALSE, so every
+# restart would replay its backfill as new mail with nothing erroring.
+sync_body <- paste(deparse(body(mx.client::mx_sync_update)), collapse = " ")
+expect_true(grepl("first_run", sync_body, fixed = TRUE))
+
+extract_formals <- names(formals(mx.client::mx_extract_text_events))
+expect_true(all(c("sync_resp", "self_id") %in% extract_formals))
+expect_identical(extract_formals[1L], "sync_resp")
+
+send_formals <- names(formals(mx.client::mx_send_text))
+expect_true(all(c("room", "msgtype", "markdown", "mentions") %in%
+                send_formals))
+expect_identical(send_formals[1:2], c("client", "text"))
+
+# chat_send passes room by name to mx_send_media; a rename upstream
+# would silently fall back to the client's default room.
+media_formals <- names(formals(mx.client::mx_send_media))
+expect_identical(media_formals[1:2], c("client", "path"))
+expect_true("room" %in% media_formals)
+
+# chat_typing goes through a session, not the client config
+expect_true("mx_client_session" %in% getNamespaceExports("mx.client"))
+# chat_poll's token self-heal
+expect_true("mx_with_relogin" %in% getNamespaceExports("mx.client"))
+
+if (requireNamespace("mx.api", quietly = TRUE)) {
+    # chat_typing passes room, typing state, and timeout by name
+    typing_formals <- names(formals(mx.api::mx_typing))
+    expect_true(all(c("room_id", "typing", "timeout") %in% typing_formals))
+    expect_identical(typing_formals[1L], "session")
+}
+
+# ---- Markdown table route ----
+
+# Matrix is the chat.api adapter where Markdown tables need a transport
+# conversion: chat.api keeps the source as markdown, mx.client renders it to
+# Matrix custom HTML, and mx.api receives the final event. Stub only the final
+# mx.api network call so this exercises the real chat.api -> mx.client path.
+if (requireNamespace("mx.api", quietly = TRUE)) {
+    sent <- new.env()
+    sent$args <- list()
+    orig_mx_send <- mx.api::mx_send
+    assignInNamespace("mx_send", function(session, room_id, body,
+                                          msgtype = "m.text", extra = NULL) {
+        sent$args[[length(sent$args) + 1L]] <<- list(
+            session = session, room_id = room_id, body = body,
+            msgtype = msgtype, extra = extra)
+        "$table:ex"
+    }, ns = "mx.api")
+    on.exit(assignInNamespace("mx_send", orig_mx_send, ns = "mx.api"),
+            add = TRUE)
+
+    table_md <- paste(c(
+        "| package | days per submission | latest |",
+        "|---|---:|---:|",
+        "| `llm.api` | 20.8 | 2026-06-26 |",
+        "| `tinyrox` | 52.5 | 2026-06-24 |"
+    ), collapse = "\n")
+    p_table <- chat_matrix(mx = list(user_id = "@bot:ex",
+                                     server = "https://ex.invalid",
+                                     token = "tok", device_id = "DEV",
+                                     room_id = "!default:ex"),
+                           .sync = function(...) NULL,
+                           .extract = function(...) list(),
+                           .media = function(...) NULL)
+    expect_identical(chat_send(p_table, "!room:ex", table_md,
+                               markup = "markdown"), "$table:ex")
+    routed <- sent$args[[1L]]
+    expect_identical(routed$room_id, "!room:ex")
+    expect_identical(routed$body, table_md)
+    expect_identical(routed$msgtype, "m.text")
+    expect_identical(routed$extra$format, "org.matrix.custom.html")
+    expect_true(grepl("<table>", routed$extra$formatted_body, fixed = TRUE))
+    expect_true(grepl("<td><code>llm.api</code></td>",
+                      routed$extra$formatted_body, fixed = TRUE))
+    expect_true(grepl("<td align=\"right\">20.8</td>",
+                      routed$extra$formatted_body, fixed = TRUE))
+}
+
+# ---- Fixtures ----
+
+fake_mx <- function(sync_token = NULL, room_id = NULL) {
+    list(user_id = "@bot:ex", server = "https://ex.invalid",
+         sync_token = sync_token, room_id = room_id)
+}
+
+# One human message, one from the bot itself, one m.notice. The bot's
+# own event is tagged is_self by the extractor; the notice is dropped
+# by its default msgtypes filter (see the asymmetry note below).
+fake_sync <- list(rooms = list(join = list("!room:ex" = list(timeline = list(
+    events = list(
+        list(type = "m.room.message", event_id = "$1", sender = "@alice:ex",
+             origin_server_ts = 1700000000000,
+             content = list(msgtype = "m.text", body = "hello",
+                            "m.mentions" = list(user_ids = list("@bot:ex")))),
+        list(type = "m.room.message", event_id = "$2", sender = "@bot:ex",
+             origin_server_ts = 1700000001000,
+             content = list(msgtype = "m.text", body = "my own echo")),
+        list(type = "m.room.message", event_id = "$3", sender = "@carol:ex",
+             origin_server_ts = 1700000002000,
+             content = list(msgtype = "m.notice", body = "a notice"))
+    )
+)))))
+
+# ---- Poll through the real extractor ----
+# Worth exercising for real rather than faking the record shape it
+# produces: this is where the adapter's assumptions about that shape are
+# either true of the installed build or not.
+
+p <- chat_matrix(mx = fake_mx(), save_cursor = FALSE,
+                 .sync = function(client, ...) {
+                     list(sync = fake_sync, client = fake_mx("s_next"),
+                          first_run = FALSE)
+                 },
+                 .send = function(...) "$id", .media = function(...) NULL)
+got <- chat_poll(p)
+
+expect_identical(got$cursor, "s_next")
+expect_identical(p$env$mx$sync_token, "s_next")
+expect_identical(got$raw, fake_sync)
+expect_false(got$first_run)
+
+# Self events are retained and flagged
+expect_identical(length(got$messages), 2L)
+expect_identical(vapply(got$messages, `[[`, "", "body"),
+                 c("hello", "my own echo"))
+expect_identical(vapply(got$messages, `[[`, logical(1), "self"),
+                 c(FALSE, TRUE))
+
+m <- got$messages[[1L]]
+expect_identical(m$id, "$1")
+expect_identical(m$channel, "!room:ex")
+expect_identical(m$sender, "@alice:ex")
+expect_identical(m$kind, "message")
+expect_identical(m$mentions, "@bot:ex")
+
+# The event's own time, by value. mx_extract_text_events only started
+# carrying ts partway through mx.client 0.1.1.1's development, and
+# builds either side of that share a version string, so this passes only
+# if the adapter also reads origin_server_ts off the sync. A class-only
+# assertion would have been satisfied by Sys.time().
+expect_inherits(m$ts, "POSIXct")
+expect_equal(as.numeric(m$ts), 1700000000, tolerance = 1e-6)
+expect_equal(as.numeric(got$messages[[2L]]$ts), 1700000001, tolerance = 1e-6)
+
+# Known asymmetry: chat_send can emit m.notice and m.emote, but
+# mx_extract_text_events filters to m.text, so the adapter never
+# receives what it can send. The notice above does not come back.
+expect_false("a notice" %in% vapply(got$messages, `[[`, "", "body"))
+
+# The record shape the adapter reads. The wire's content$m.relates_to
+# arrives as the record's `relates_to`, so nothing here looks for the
+# wire name.
+expect_true(all(c("room_id", "event_id", "sender", "is_self", "body",
+                  "msgtype", "mentions") %in% names(m$raw)))
+expect_false("content" %in% names(m$raw))
+expect_null(m$raw[["m.relates_to"]])
+# An unthreaded message has no thread, and NULL is the answer.
+expect_null(m$thread)
+expect_true(chat_capabilities(p)$thread_replies)
+
+# ---- A thread survives the real extractor ----
+# The end of the round trip, against the installed mx.client rather
+# than a faked record: if that build ever stops carrying relates_to,
+# $thread goes quietly empty and rehydration downstream loses the
+# conversation it was keyed to. This is the line that would go red.
+local({
+    thr_sync <- list(rooms = list(join = list("!room:ex" = list(
+        timeline = list(events = list(
+            list(type = "m.room.message", event_id = "$t1",
+                 sender = "@alice:ex", origin_server_ts = 1700000003000,
+                 content = list(msgtype = "m.text", body = "in a thread",
+                     "m.relates_to" = list(rel_type = "m.thread",
+                         event_id = "$root", is_falling_back = TRUE,
+                         "m.in_reply_to" = list(event_id = "$root")))),
+            list(type = "m.room.message", event_id = "$t2",
+                 sender = "@alice:ex", origin_server_ts = 1700000004000,
+                 content = list(msgtype = "m.text", body = "a rich reply",
+                     "m.relates_to" = list(
+                         "m.in_reply_to" = list(event_id = "$orig"))))
+        ))))))
+    tp <- chat_matrix(mx = fake_mx(), save_cursor = FALSE,
+                      .sync = function(client, ...) {
+                          list(sync = thr_sync, client = fake_mx("s2"),
+                               first_run = FALSE)
+                      },
+                      .send = function(...) "$id",
+                      .media = function(...) NULL)
+    msgs <- chat_poll(tp)$messages
+    expect_identical(length(msgs), 2L)
+    expect_identical(msgs[[1L]]$thread, "$root")
+    # And a rich reply is still not a thread, through the real
+    # extractor as much as through a faked record.
+    expect_null(msgs[[2L]]$thread)
+})
+
+# ---- Media through the real extractor ----
+# Every media assertion in test_matrix.R hands the adapter a record the
+# test wrote itself, so all of them would keep passing if
+# mx_extract_media_events() named its fields differently. This is the
+# one place the mapping meets the installed build.
+if ("mx_extract_media_events" %in% getNamespaceExports("mx.client")) {
+    med_formals <- names(formals(mx.client::mx_extract_media_events))
+    expect_identical(med_formals[1:2], c("sync_resp", "self_id"))
+
+    med_sync <- list(rooms = list(join = list("!room:ex" = list(
+        timeline = list(events = list(
+            list(type = "m.room.message", event_id = "$m1",
+                 sender = "@alice:ex", origin_server_ts = 1700000005000,
+                 content = list(msgtype = "m.image", body = "IMG_0942.png",
+                     url = "mxc://ex/abc",
+                     info = list(mimetype = "image/png", size = 4096))),
+            list(type = "m.room.message", event_id = "$m2",
+                 sender = "@alice:ex", origin_server_ts = 1700000006000,
+                 content = list(msgtype = "m.text", body = "what is this"))
+        ))))))
+    mp <- chat_matrix(mx = fake_mx(), save_cursor = FALSE,
+                      .sync = function(client, ...) {
+                          list(sync = med_sync, client = fake_mx("s3"),
+                               first_run = FALSE)
+                      },
+                      .send = function(...) "$id",
+                      .media = function(...) NULL)
+    mmsgs <- chat_poll(mp)$messages
+    # The picture and the question, in the order the room had them.
+    expect_identical(vapply(mmsgs, `[[`, "", "id"), c("$m1", "$m2"))
+    img <- mmsgs[[1L]]
+    expect_identical(img$body, "IMG_0942.png")
+    expect_identical(length(img$attachments), 1L)
+    # By value, not by class: every one of these is a field name the
+    # adapter reads off the record, and a rename upstream would leave
+    # an attachment that is present and empty.
+    att <- img$attachments[[1L]]
+    expect_identical(att$url, "mxc://ex/abc")
+    expect_identical(att$mime, "image/png")
+    expect_identical(att$bytes, 4096L)
+    expect_identical(att$name, "IMG_0942.png")
+    expect_false(isTRUE(att$raw$encrypted))
+    expect_equal(as.numeric(img$ts), 1700000005, tolerance = 1e-6)
+    # The text message beside it carries none, so a consumer testing
+    # length(attachments) is not answering yes for every message.
+    expect_null(mmsgs[[2L]]$attachments)
+    expect_true(chat_capabilities(mp)$attachments)
+}
+
+# ---- Resolve ----
+# Offline: mx_resolve_room short-circuits on a !-prefixed id and on an
+# empty name, so both paths run without a homeserver.
+
+r <- chat_matrix(mx = fake_mx(room_id = "!default:ex"),
+                 .sync = function(...) NULL,
+                 .extract = function(...) list(),
+                 .send = function(...) "$id", .media = function(...) NULL)
+# A literal room id passes through untouched
+expect_identical(chat_resolve(r, "!real:ex"), "!real:ex")
+# An empty name falls back to the client's default room rather than
+# erroring. That is mx_resolve_room's fallback = TRUE default, and the
+# adapter does not override it, so a caller that resolves an empty name
+# posts into the default room. Pinned so the behaviour stays deliberate.
+expect_identical(chat_resolve(r, ""), "!default:ex")
+# With no default room there is nothing to fall back to, and it errors
+# instead of returning NULL
+no_default <- chat_matrix(mx = fake_mx(), .sync = function(...) NULL,
+                          .extract = function(...) list(),
+                          .send = function(...) "$id",
+                          .media = function(...) NULL)
+expect_error(chat_resolve(no_default, ""))
+
+# ---- Typing ----
+
+fake_send <- function(...) "$sent"
+fake_media <- function(...) NULL
+
+# Typing is best-effort: a client that cannot produce a session
+# reports FALSE rather than propagating the error into a chat loop.
+broken <- chat_matrix(mx = list(), .sync = function(...) NULL,
+                      .extract = function(...) list(),
+                      .send = fake_send, .media = fake_media)
+expect_false(chat_typing(broken, "!room:ex", on = TRUE))
+
+# The success path needs a config complete enough for
+# mx_client_session(), so the real config -> session mapping runs;
+# .typing stands in for the homeserver call.
+typing_calls <- new.env()
+typing_calls$args <- list()
+fake_typing <- function(session, room_id, ...) {
+    typing_calls$args[[length(typing_calls$args) + 1L]] <- c(
+        list(session = session, room_id = room_id), list(...))
+    invisible(NULL)
+}
+ty <- chat_matrix(mx = list(user_id = "@bot:ex",
+                            server = "https://ex.invalid",
+                            token = "tok", device_id = "DEV"),
+                  .sync = function(...) NULL,
+                  .extract = function(...) list(),
+                  .send = fake_send, .media = fake_media,
+                  .typing = fake_typing)
+
+expect_true(chat_typing(ty, "!room:ex"))
+t1 <- typing_calls$args[[1L]]
+expect_inherits(t1$session, "mx_session")
+expect_identical(t1$room_id, "!room:ex")
+expect_true(t1$typing)
+# Default is 30 seconds, converted to the milliseconds mx.api wants
+expect_identical(t1$timeout, 30000L)
+
+# A caller working through a slow model turn picks its own window
+expect_true(chat_typing(ty, "!room:ex", on = TRUE, timeout = 120))
+expect_identical(typing_calls$args[[2L]]$timeout, 120000L)
+
+# ... and clears it afterwards: the off path goes out as
+# typing = FALSE rather than being dropped or inverted
+expect_true(chat_typing(ty, "!room:ex", on = FALSE))
+expect_false(typing_calls$args[[3L]]$typing)
+
+# A NULL timeout falls back to the default instead of erroring
+chat_typing(ty, "!room:ex", timeout = NULL)
+expect_identical(typing_calls$args[[4L]]$timeout, 30000L)
+
+# A failing homeserver call is still swallowed, seam or not
+boom <- chat_matrix(mx = list(user_id = "@bot:ex",
+                              server = "https://ex.invalid",
+                              token = "tok", device_id = "DEV"),
+                    .sync = function(...) NULL,
+                    .extract = function(...) list(),
+                    .send = fake_send, .media = fake_media,
+                    .typing = function(...) stop("homeserver down"))
+expect_false(chat_typing(boom, "!room:ex"))
+
+# ---- The real crypto boundary functions ----
+# These sit behind chat_matrix()'s .crypto seam, so the adapter-routing
+# tests in test_matrix.R never reach them. Their failure modes are the
+# two that leak, so they are driven directly here against stubbed
+# mx.client / mx.api entry points.
+
+crypto_ctx <- function(encrypted = character(), store = tempfile("cs")) {
+    ctx <- new.env(parent = emptyenv())
+    ctx$encrypted <- encrypted
+    ctx$store <- store
+    ctx$account <- NULL
+    ctx$sessions <- list()
+    ctx
+}
+
+stub <- function(name, value, ns) {
+    orig <- get(name, envir = asNamespace(ns))
+    assignInNamespace(name, value, ns = ns)
+    orig
+}
+
+mx_cfg <- list(user_id = "@bot:ex", device_id = "DEV",
+               server = "https://ex.invalid", token = "tok")
+
+# An unanswerable encryption state aborts rather than answering FALSE.
+# Turning an expired token, a timeout, or a 500 into "not encrypted" sent
+# the message in the clear.
+local({
+    orig <- stub("mx_room_encrypted",
+                 function(...) stop("Matrix error [M_UNKNOWN_TOKEN]"),
+                 "mx.client")
+    on.exit(assignInNamespace("mx_room_encrypted", orig, ns = "mx.client"))
+    expect_error(
+        chat.api:::matrix_room_is_encrypted(crypto_ctx(), mx_cfg, "!r:ex"),
+        "cannot determine the encryption state")
+})
+
+# A room that answers TRUE is remembered, so the next send skips the
+# lookup -- which is also what keeps a transient failure from blocking a
+# room already known to be encrypted.
+local({
+    ctx <- crypto_ctx()
+    orig <- stub("mx_room_encrypted", function(...) TRUE, "mx.client")
+    on.exit(assignInNamespace("mx_room_encrypted", orig, ns = "mx.client"))
+    expect_true(chat.api:::matrix_room_is_encrypted(ctx, mx_cfg, "!r:ex"))
+    expect_true("!r:ex" %in% ctx$encrypted)
+})
+local({
+    ctx <- crypto_ctx(encrypted = "!r:ex")
+    orig <- stub("mx_room_encrypted", function(...) stop("down"), "mx.client")
+    on.exit(assignInNamespace("mx_room_encrypted", orig, ns = "mx.client"))
+    expect_true(chat.api:::matrix_room_is_encrypted(ctx, mx_cfg, "!r:ex"))
+})
+
+# A room that answers FALSE is a plaintext room, and is not cached: the
+# next send asks again, so a room that turns encryption on is caught.
+local({
+    asked <- 0L
+    ctx <- crypto_ctx()
+    orig <- stub("mx_room_encrypted",
+                 function(...) { asked <<- asked + 1L; FALSE }, "mx.client")
+    on.exit(assignInNamespace("mx_room_encrypted", orig, ns = "mx.client"))
+    expect_false(chat.api:::matrix_room_is_encrypted(ctx, mx_cfg, "!r:ex"))
+    expect_false(chat.api:::matrix_room_is_encrypted(ctx, mx_cfg, "!r:ex"))
+    expect_identical(asked, 2L)
+    expect_identical(ctx$encrypted, character())
+})
+
+# No crypto context is not an encrypted room, and asks nobody.
+local({
+    orig <- stub("mx_room_encrypted", function(...) stop("must not be asked"),
+                 "mx.client")
+    on.exit(assignInNamespace("mx_room_encrypted", orig, ns = "mx.client"))
+    expect_false(chat.api:::matrix_room_is_encrypted(NULL, mx_cfg, "!r:ex"))
+})
+
+# Membership discovery is not best-effort. mx_send_encrypted() derives
+# the recipient devices from member_ids: an empty list shares the room key
+# with nobody, posts the event anyway, and returns an event id, so the
+# room cannot read the message while the caller records a successful send.
+local({
+    sent <- 0L
+    o1 <- stub("mx_client_session", function(...) list(server = "s"),
+               "mx.client")
+    o2 <- stub("mx_room_members", function(...) stop("500 from homeserver"),
+               "mx.api")
+    o3 <- stub("mx_send_encrypted",
+               function(...) { sent <<- sent + 1L
+                               list(event_id = "$e", sessions = list()) },
+               "mx.client")
+    on.exit({
+        assignInNamespace("mx_client_session", o1, ns = "mx.client")
+        assignInNamespace("mx_room_members", o2, ns = "mx.api")
+        assignInNamespace("mx_send_encrypted", o3, ns = "mx.client")
+    })
+    expect_error(chat.api:::matrix_crypto_send(crypto_ctx(), mx_cfg, "!r:ex",
+                                               "secret"),
+                 "500 from homeserver")
+    expect_identical(sent, 0L)
+})
+
+# An empty member list is the same refusal, reached without an error to
+# propagate.
+local({
+    sent <- 0L
+    o1 <- stub("mx_client_session", function(...) list(server = "s"),
+               "mx.client")
+    o2 <- stub("mx_room_members", function(...) character(), "mx.api")
+    o3 <- stub("mx_send_encrypted",
+               function(...) { sent <<- sent + 1L
+                               list(event_id = "$e", sessions = list()) },
+               "mx.client")
+    on.exit({
+        assignInNamespace("mx_client_session", o1, ns = "mx.client")
+        assignInNamespace("mx_room_members", o2, ns = "mx.api")
+        assignInNamespace("mx_send_encrypted", o3, ns = "mx.client")
+    })
+    expect_error(chat.api:::matrix_crypto_send(crypto_ctx(), mx_cfg, "!r:ex",
+                                               "secret"),
+                 "reach nobody")
+    expect_identical(sent, 0L)
+})
+
+# A session that cannot be built is the same: no send.
+local({
+    sent <- 0L
+    o1 <- stub("mx_client_session", function(...) stop("no server in config"),
+               "mx.client")
+    o3 <- stub("mx_send_encrypted",
+               function(...) { sent <<- sent + 1L
+                               list(event_id = "$e", sessions = list()) },
+               "mx.client")
+    on.exit({
+        assignInNamespace("mx_client_session", o1, ns = "mx.client")
+        assignInNamespace("mx_send_encrypted", o3, ns = "mx.client")
+    })
+    expect_error(chat.api:::matrix_crypto_send(crypto_ctx(), mx_cfg, "!r:ex",
+                                               "secret"),
+                 "no server in config")
+    expect_identical(sent, 0L)
+})
+
+# With members, the send goes through and carries them, plus the content
+# the cleartext path would have PUT.
+local({
+    seen <- NULL
+    o1 <- stub("mx_client_session", function(...) list(server = "s"),
+               "mx.client")
+    o2 <- stub("mx_room_members", function(...) c("@a:ex", "@b:ex"), "mx.api")
+    o3 <- stub("mx_send_encrypted",
+               function(client, account, sessions, room_id, content, store_dir,
+                        recipients = NULL, member_ids = NULL) {
+                   seen <<- list(content = content, member_ids = member_ids,
+                                 room_id = room_id)
+                   list(event_id = "$enc", sessions = "new")
+               }, "mx.client")
+    on.exit({
+        assignInNamespace("mx_client_session", o1, ns = "mx.client")
+        assignInNamespace("mx_room_members", o2, ns = "mx.api")
+        assignInNamespace("mx_send_encrypted", o3, ns = "mx.client")
+    })
+    ctx <- crypto_ctx()
+    expect_identical(chat.api:::matrix_crypto_send(ctx, mx_cfg, "!r:ex",
+                                                   "**hi**",
+                                                   markdown = TRUE), "$enc")
+    expect_identical(seen$member_ids, c("@a:ex", "@b:ex"))
+    expect_identical(seen$content$body, "**hi**")
+    expect_identical(seen$content$format, "org.matrix.custom.html")
+    expect_true(grepl("<strong>hi</strong>", seen$content$formatted_body))
+    # The updated session set is kept, or the next send re-shares the key.
+    expect_identical(ctx$sessions, "new")
+})
+
+# The content an encrypted send wraps is the one mx_send_text() PUTs in
+# the clear, so a room's encryption state changes the envelope and
+# nothing a reader sees.
+content <- chat.api:::matrix_crypto_content
+expect_identical(content("hi")$body, "hi")
+expect_null(content("hi")$formatted_body)
+expect_identical(content("hi", msgtype = "m.notice")$msgtype, "m.notice")
+expect_true(grepl("<strong>hi</strong>",
+                  content("**hi**", markdown = TRUE)$formatted_body))
+m <- content("hi", mentions = "@c:ex")
+expect_identical(m[["m.mentions"]]$user_ids, list("@c:ex"))
+expect_identical(m$format, "org.matrix.custom.html")
+
+# matrix_crypto_init() binds the store before it opens the account, so a
+# store belonging to another device is refused rather than unpickled.
+# Every mx.client entry point below is stubbed: what is under test is the
+# order of the adapter's own steps, not the cryptography.
+if (requireNamespace("mx.crypto", quietly = TRUE)) {
+    local({
+        opened <- 0L
+        o1 <- stub("mx_crypto_account",
+                   function(...) { opened <<- opened + 1L; "acct" },
+                   "mx.client")
+        o2 <- stub("mx_crypto_publish_keys", function(...) invisible(TRUE),
+                   "mx.client")
+        o3 <- stub("mx_crypto_sessions_load", function(...) list(),
+                   "mx.client")
+        o4 <- stub("mx_client_session", function(...) list(server = "s"),
+                   "mx.client")
+        o5 <- stub("mxc_account_identity_keys",
+                   function(...) list(curve25519 = "C", ed25519 = "E"),
+                   "mx.crypto")
+        # A homeserver that has never seen this device, and no rooms. The
+        # published-key check is exercised on its own further down.
+        o6 <- stub("mx_keys_query", function(...) list(device_keys = list()),
+                   "mx.api")
+        o7 <- stub("mx_rooms", function(...) character(), "mx.api")
+        on.exit({
+            assignInNamespace("mx_crypto_account", o1, ns = "mx.client")
+            assignInNamespace("mx_crypto_publish_keys", o2, ns = "mx.client")
+            assignInNamespace("mx_crypto_sessions_load", o3, ns = "mx.client")
+            assignInNamespace("mx_client_session", o4, ns = "mx.client")
+            assignInNamespace("mxc_account_identity_keys", o5, ns = "mx.crypto")
+            assignInNamespace("mx_keys_query", o6, ns = "mx.api")
+            assignInNamespace("mx_rooms", o7, ns = "mx.api")
+        })
+
+        store <- tempfile("initstore")
+        a <- list(user_id = "@a:ex", device_id = "D1", token = "t",
+                  server = "https://ex.invalid")
+        ctx <- chat.api:::matrix_crypto_init(a, store = store)
+        expect_identical(ctx$store, store)
+        expect_identical(opened, 1L)
+        expect_identical(readLines(file.path(store, "identity.txt")),
+                         c("@a:ex", "D1"))
+
+        # Another device pointed at the same store is refused, and the
+        # account is never opened for it.
+        b <- list(user_id = "@b:ex", device_id = "D2", token = "t",
+                  server = "https://ex.invalid")
+        expect_error(chat.api:::matrix_crypto_init(b, store = store),
+                     "belongs to")
+        expect_identical(opened, 1L)
+        unlink(store, recursive = TRUE)
+    })
+}
+
+# The store path is per device, and its sanitization is not injective:
+# "@a/b:ex" and "@a_b:ex" resolve to the same directory. That is why the
+# identity is written into the store and compared on open -- the
+# collision is caught there, in test_matrix.R. Resolving the path calls
+# mx_crypto_store_dir(), which is why this half lives here.
+local({
+    a <- list(user_id = "@a/b:ex", device_id = "D")
+    b <- list(user_id = "@a_b:ex", device_id = "D")
+    expect_identical(chat.api:::matrix_crypto_store(a, app = "t"),
+                     chat.api:::matrix_crypto_store(b, app = "t"))
+    # Two devices of one user are two stores, and two users are two too.
+    one <- list(user_id = "@a:ex", device_id = "D1")
+    two <- list(user_id = "@a:ex", device_id = "D2")
+    expect_false(identical(chat.api:::matrix_crypto_store(one, app = "t"),
+                           chat.api:::matrix_crypto_store(two, app = "t")))
+    expect_false(identical(chat.api:::matrix_crypto_store(one, app = "t"),
+                           chat.api:::matrix_crypto_store(
+                               list(user_id = "@b:ex", device_id = "D1"),
+                               app = "t")))
+    # It sits under mx.client's own store convention for the app.
+    expect_true(startsWith(chat.api:::matrix_crypto_store(one, app = "t"),
+                           mx.client::mx_crypto_store_dir(app = "t")))
+})
+
+# ---- One identity per device, durably ----
+# The in-process cache stops two contexts existing at once and nothing
+# more: restart, or matrix_crypto_forget(), and a changed crypto_store
+# would mint a fresh account and publish different long-lived keys under
+# the old device_id. The homeserver is the authority on which keys a
+# device has, so that is what init checks against.
+#
+# The raw /keys/query response is stubbed rather than
+# mx_crypto_known_devices(), because that helper drops entries whose
+# signatures fail and this check has to tell "no entry" from "an entry
+# that will not verify".
+if (requireNamespace("mx.crypto", quietly = TRUE)) {
+    init_stubs <- function(query, verify = NULL) {
+        list(
+            mx_crypto_account = stub("mx_crypto_account", function(...) "acct",
+                                     "mx.client"),
+            mx_crypto_publish_keys = stub("mx_crypto_publish_keys",
+                                          function(...) invisible(TRUE),
+                                          "mx.client"),
+            mx_crypto_sessions_load = stub("mx_crypto_sessions_load",
+                                           function(...) list(), "mx.client"),
+            mx_client_session = stub("mx_client_session",
+                                     function(...) list(server = "s"),
+                                     "mx.client"),
+            mx_keys_query = stub("mx_keys_query", query, "mx.api"),
+            # Spelled out rather than `verify %||% default`: base R has
+            # no %||% before 4.4, and this package supports R 4.0.
+            mxc_verify_device_keys = stub(
+                "mxc_verify_device_keys",
+                if (is.null(verify)) {
+                    function(...) list(curve25519 = "CURVE-ours",
+                                       ed25519 = "ED-ours")
+                } else {
+                    verify
+                },
+                "mx.crypto"),
+            mxc_account_identity_keys = stub(
+                "mxc_account_identity_keys",
+                function(...) list(curve25519 = "CURVE-ours",
+                                   ed25519 = "ED-ours"), "mx.crypto"))
+    }
+    restore_stubs <- function(o) {
+        ns_of <- function(nm) {
+            if (startsWith(nm, "mxc_")) "mx.crypto"
+            else if (nm == "mx_keys_query") "mx.api"
+            else "mx.client"
+        }
+        for (nm in names(o)) assignInNamespace(nm, o[[nm]], ns = ns_of(nm))
+    }
+    me <- list(user_id = "@a:ex", device_id = "D1", token = "t",
+               server = "https://ex.invalid")
+    entry_for <- function(...) {
+        list(device_keys = list(`@a:ex` = list(...)))
+    }
+    with_init <- function(stubs, expr) {
+        o <- stubs
+        on.exit(restore_stubs(o))
+        force(expr)
+    }
+
+    # A device the homeserver has never seen is the first run.
+    local({
+        asked <- NULL
+        o <- init_stubs(function(session, device_keys, ...) {
+            asked <<- names(device_keys)
+            entry_for()
+        })
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub1")
+        expect_true(is.environment(chat.api:::matrix_crypto_init(me,
+                                                                 store = store)))
+        # It asks about its own user, not the room's members.
+        expect_identical(asked, "@a:ex")
+        unlink(store, recursive = TRUE)
+    })
+
+    # Keys that match are this device's own account: proceed.
+    local({
+        o <- init_stubs(function(...) entry_for(D1 = list(keys = "whatever")))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub2")
+        expect_true(is.environment(chat.api:::matrix_crypto_init(me,
+                                                                 store = store)))
+        unlink(store, recursive = TRUE)
+    })
+
+    # Keys that differ mean this store is not this device's. This is the
+    # case a restart plus a changed crypto_store produced, which nothing
+    # in the process cache could have seen.
+    local({
+        o <- init_stubs(
+            function(...) entry_for(D1 = list(keys = "whatever")),
+            verify = function(...) list(curve25519 = "CURVE-theirs",
+                                        ed25519 = "ED-theirs"))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub3")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store),
+                     "already has different device keys")
+        unlink(store, recursive = TRUE)
+    })
+
+    # An entry that will not verify is NOT an absent entry. A tampered or
+    # signature-stripped record for our own device used to be dropped by
+    # mx_crypto_known_devices() with a warning, come back as "no device",
+    # and get published over.
+    local({
+        o <- init_stubs(
+            function(...) entry_for(D1 = list(keys = "tampered")),
+            verify = function(...) stop("signature does not verify"))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub4")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store),
+                     "do not verify")
+        unlink(store, recursive = TRUE)
+    })
+
+    # ... and it does not publish over one either.
+    local({
+        uploads <- 0L
+        o <- init_stubs(
+            function(...) entry_for(D1 = list(keys = "tampered")),
+            verify = function(...) stop("signature does not verify"))
+        assignInNamespace("mx_crypto_publish_keys",
+                          function(...) { uploads <<- uploads + 1L
+                                          invisible(TRUE) }, ns = "mx.client")
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub5")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store))
+        expect_identical(uploads, 0L)
+        unlink(store, recursive = TRUE)
+    })
+
+    # Another device of the same user is not this device, and does not
+    # collide with it.
+    local({
+        o <- init_stubs(function(...) entry_for(D2 = list(keys = "other")))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub6")
+        expect_true(is.environment(chat.api:::matrix_crypto_init(me,
+                                                                 store = store)))
+        unlink(store, recursive = TRUE)
+    })
+
+    # A query that cannot be answered is an error, not a shrug. init is
+    # about to publish keys to that same homeserver, so being unable to
+    # ask it anything is not a state to publish from.
+    local({
+        o <- init_stubs(function(...) stop("504 from homeserver"))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub7")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store),
+                     "cannot read this device's published keys")
+        unlink(store, recursive = TRUE)
+    })
+
+    # /keys/query answers 200 with a `failures` map when it could not
+    # reach a server, and returns whatever it did manage. This query names
+    # one user -- ours -- so any failure means the question went
+    # unanswered, and the empty device_keys beside it is not evidence of a
+    # device that was never published. A request that throws and one that
+    # succeeds with nothing in it are the same state here.
+    local({
+        uploads <- 0L
+        o <- init_stubs(function(...) list(
+            failures = list(ex = list(errcode = "M_UNKNOWN",
+                                      error = "Failed to fetch keys")),
+            device_keys = list()))
+        assignInNamespace("mx_crypto_publish_keys",
+                          function(...) { uploads <<- uploads + 1L
+                                          invisible(TRUE) }, ns = "mx.client")
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub9")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store),
+                     "could not answer for ex")
+        expect_identical(uploads, 0L)
+        unlink(store, recursive = TRUE)
+    })
+
+    # An empty failures map is not a failure: that is the ordinary
+    # first-run answer and must not start erroring.
+    local({
+        o <- init_stubs(function(...) list(failures = list(),
+                                           device_keys = list()))
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub10")
+        expect_true(is.environment(chat.api:::matrix_crypto_init(me,
+                                                                 store = store)))
+        unlink(store, recursive = TRUE)
+    })
+
+    # The check runs before the upload, so a mismatch never publishes.
+    local({
+        uploads <- 0L
+        o <- init_stubs(
+            function(...) entry_for(D1 = list(keys = "whatever")),
+            verify = function(...) list(curve25519 = "CURVE-theirs",
+                                        ed25519 = "ED-theirs"))
+        assignInNamespace("mx_crypto_publish_keys",
+                          function(...) { uploads <<- uploads + 1L
+                                          invisible(TRUE) }, ns = "mx.client")
+        on.exit(restore_stubs(o))
+        store <- tempfile("pub8")
+        expect_error(chat.api:::matrix_crypto_init(me, store = store))
+        expect_identical(uploads, 0L)
+        unlink(store, recursive = TRUE)
+    })
+}
+
+# ---- Channel info and members ----
+# Two verbs, not the one the migration plan named. A name and a topic are
+# two short strings that change rarely; a member list is unbounded and
+# changes constantly. Bundling them makes every read of a topic pay for a
+# member list, and a consumer caches the two on different schedules for
+# exactly that reason.
+#
+# Here rather than in test_matrix.R because both go through
+# mx_client_session(), the same reason chat_typing() and chat_resolve()
+# are tested here.
+
+info_client <- function(info = NULL, members = NULL) {
+    chat_matrix(mx = list(user_id = "@bot:ex", server = "https://ex.invalid",
+                          token = "tok", device_id = "DEV"),
+                .sync = function(...) NULL, .extract = function(...) list(),
+                .send = function(...) "$id", .media = function(...) NULL,
+                .info = info, .members = members)
+}
+
+local({
+    cl <- info_client(info = list(name = function(s, r) "The Lab",
+                                  topic = function(s, r) "cwd=/srv/lab"),
+                      members = function(s, r) c("@a:ex", "@b:ex"))
+    info <- chat_channel_info(cl, "!room:ex")
+    expect_identical(info$id, "!room:ex")
+    expect_identical(info$name, "The Lab")
+    expect_identical(info$topic, "cwd=/srv/lab")
+    expect_identical(chat_members(cl, "!room:ex"), c("@a:ex", "@b:ex"))
+})
+
+# A room with neither is the ordinary case for a direct message. mx.api
+# raises M_NOT_FOUND for an absent state event, which is the answer
+# "there is none" rather than a failure -- NULL, which is what the
+# contract says a missing field looks like.
+local({
+    cl <- info_client(info = list(name = function(s, r) stop("M_NOT_FOUND"),
+                                  topic = function(s, r) stop("M_NOT_FOUND")))
+    info <- chat_channel_info(cl, "!dm:ex")
+    expect_null(info$name)
+    expect_null(info$topic)
+    # The id is still answered: it is what the caller passed in.
+    expect_identical(info$id, "!dm:ex")
+})
+
+# An empty string is not a name. A room whose name was set and later
+# cleared reads as "" and must not come back as one.
+local({
+    cl <- info_client(info = list(name = function(s, r) "",
+                                  topic = function(s, r) character()))
+    info <- chat_channel_info(cl, "!room:ex")
+    expect_null(info$name)
+    expect_null(info$topic)
+})
+
+# One present and one absent is not all-or-nothing.
+local({
+    cl <- info_client(info = list(name = function(s, r) stop("M_NOT_FOUND"),
+                                  topic = function(s, r) "just a topic"))
+    info <- chat_channel_info(cl, "!room:ex")
+    expect_null(info$name)
+    expect_identical(info$topic, "just a topic")
+})
+
+# Members errors propagate. An empty room and an unanswerable question
+# are different things, and character() has to mean only the first.
+expect_error(chat_members(info_client(members = function(s, r) stop("403")),
+                          "!room:ex"), "403")
+expect_identical(chat_members(info_client(members = function(s, r) character()),
+                              "!room:ex"), character())
+
+# Both capabilities are TRUE and both verbs exist behind them.
+local({
+    caps <- chat_capabilities(info_client())
+    expect_true(caps$channel_info)
+    expect_true(caps$members)
+    expect_true(is.function(getS3method("chat_channel_info", "chat_matrix")))
+    expect_true(is.function(getS3method("chat_members", "chat_matrix")))
+})
+
+# Drift detection: the adapter passes (session, room_id) positionally.
+expect_identical(names(formals(mx.api::mx_room_name))[1:2],
+                 c("session", "room_id"))
+expect_identical(names(formals(mx.api::mx_room_topic))[1:2],
+                 c("session", "room_id"))
+expect_identical(names(formals(mx.api::mx_room_members))[1:2],
+                 c("session", "room_id"))
+
+# ---- Config lifecycle: drift against mx.client's real signatures ----
+# These have no seams: they exist to touch a real file, so there is
+# nothing to fake. Drift detection is the only guard available.
+for (fn in c("mx_client_load", "mx_client_save", "mx_client_config_path",
+             "mx_client_legacy_config_path", "mx_client_configure",
+             "mx_client_relogin", "mx_set_displayname")) {
+    expect_true(is.function(getExportedValue("mx.client", fn)), info = fn)
+}
+expect_true(all(c("app", "path", "env_var") %in%
+                names(formals(mx.client::mx_client_load))))
+expect_true(all(c("client", "app", "path") %in%
+                names(formals(mx.client::mx_client_save))))
+expect_identical(names(formals(mx.client::mx_client_save))[1L], "client")
+expect_true(all(c("server", "user", "password", "room", "app", "path",
+                  "device_id", "extra") %in%
+                names(formals(mx.client::mx_client_configure))))
+
+# ---- chat_config ----
+local({
+    cfg <- chat_config(list(server = "https://ex.invalid", user = "bot",
+                            operators = "@troy:ex"),
+                       app = "demo", path = "/tmp/demo.json")
+    expect_inherits(cfg, "chat_config")
+    # An application's own fields pass through. corteza keeps `bots`,
+    # `operators` and a model preference in the same file, and a loader
+    # that dropped them would make the file unreadable by its owner.
+    expect_identical(cfg$operators, "@troy:ex")
+    expect_identical(attr(cfg, "app"), "demo")
+    expect_identical(attr(cfg, "path"), "/tmp/demo.json")
+    # app and path are attributes, never fields: a field would collide
+    # with an application that already keeps one by that name, and would
+    # be written into the file as though it were part of the config.
+    expect_false("app" %in% names(cfg))
+    expect_false("path" %in% names(cfg))
+    expect_false("app" %in% names(chat.api:::unclass_config(cfg)))
+    expect_null(attr(chat.api:::unclass_config(cfg), "path"))
+})
+
+# print() shows the field names and never the values. A config holds an
+# access token and usually a password, and printing one at a prompt is
+# how it reaches a scrollback, a screenshot, or a pasted bug report.
+local({
+    cfg <- chat_config(list(token = "syt_secret", password = "hunter2"),
+                       path = "/tmp/x.json")
+    out <- paste(capture.output(print(cfg)), collapse = " ")
+    expect_false(grepl("syt_secret", out, fixed = TRUE))
+    expect_false(grepl("hunter2", out, fixed = TRUE))
+    expect_true(grepl("token", out, fixed = TRUE))
+    expect_true(grepl("/tmp/x.json", out, fixed = TRUE))
+})
+
+# ---- Round trip through a real file ----
+local({
+    dir <- tempfile("cfg-")
+    dir.create(dir)
+    on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+    path <- file.path(dir, "matrix.json")
+
+    cfg <- chat_config(list(server = "https://ex.invalid", user = "bot",
+                            token = "tok", user_id = "@bot:ex",
+                            device_id = "DEV1", operators = "@troy:ex"),
+                       path = path)
+    chat_config_save(cfg)
+    expect_true(file.exists(path))
+    # The token file must be 0600 on Unix. Windows file.mode() does not
+    # report Unix owner/group permissions or Windows access-control lists.
+    if (.Platform$OS.type == "unix") {
+        expect_identical(substr(as.character(file.mode(path)), 1L, 3L), "600")
+    }
+
+    back <- chat_matrix_config(path = path)
+    expect_inherits(back, "chat_config")
+    expect_identical(back$user_id, "@bot:ex")
+    expect_identical(back$operators, "@troy:ex")
+    # It knows where it came from, so chat_config_save() can write it
+    # back without being told twice.
+    expect_identical(normalizePath(attr(back, "path")), normalizePath(path))
+
+    back$operators <- c("@troy:ex", "@jorge:ex")
+    chat_config_save(back)
+    expect_identical(chat_matrix_config(path = path)$operators,
+                     c("@troy:ex", "@jorge:ex"))
+})
+
+# A config with nowhere to go says so, rather than writing somewhere
+# arbitrary and reporting success.
+expect_error(chat_config_save(chat_config(list(user = "bot"))),
+             "nowhere to write")
+
+# ---- Paths ----
+expect_true(is.character(chat_matrix_config_path("demo")))
+expect_true(nzchar(chat_matrix_config_path("demo")))
+expect_false(identical(chat_matrix_config_path("demo"),
+                       chat_matrix_config_path("demo", legacy = TRUE)))
+local({
+    var <- "CHAT_API_TEST_CONFIG"
+    old <- Sys.getenv(var, unset = NA)
+    on.exit(if (is.na(old)) Sys.unsetenv(var) else
+        do.call(Sys.setenv, stats::setNames(list(old), var)), add = TRUE)
+    do.call(Sys.setenv, stats::setNames(list("/tmp/override.json"), var))
+    expect_identical(chat_matrix_config_path("demo", env_var = var),
+                     "/tmp/override.json")
+})
+
+# ---- A config drives a client ----
+local({
+    cfg <- chat_config(list(server = "https://ex.invalid", user = "bot",
+                            token = "tok", user_id = "@bot:ex",
+                            device_id = "DEV1"))
+    cl <- chat_matrix(mx = cfg, .sync = function(...) NULL,
+                      .extract = function(...) list(),
+                      .send = function(...) "$1", .media = function(...) NULL)
+    expect_identical(chat_whoami(cl)$id, "@bot:ex")
+})
+
+# ---- chat_set_identity picks up a rotation it did not perform ----
+# The rename wraps itself in a relogin that persists a refreshed token
+# before retrying, then returns only TRUE and discards the client it
+# refreshed. So the live token can be on disk and not in memory, and the
+# only way to have it is to read it back. This is what lets a consumer
+# hold one client across a rename instead of rebuilding one per send off
+# a file they both happen to write.
+local({
+    dir <- tempfile("ident-")
+    dir.create(dir)
+    on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+    path <- file.path(dir, "matrix.json")
+
+    cfg <- chat_config(list(server = "https://ex.invalid", user = "bot",
+                            password = "pw", token = "tok",
+                            user_id = "@bot:ex", device_id = "DEV1"),
+                       path = path)
+    chat_config_save(cfg)
+
+    cl <- chat_matrix(mx = cfg, .sync = function(...) NULL,
+                      .extract = function(...) list(),
+                      .send = function(...) "$1", .media = function(...) NULL,
+                      .identity = function(client, name, ...) {
+                          # What a relogin inside the rename does: write
+                          # the new token, report only success.
+                          on_disk <- chat_matrix_config(path = path)
+                          on_disk$token <- "rotated"
+                          chat_config_save(on_disk)
+                          invisible(TRUE)
+                      })
+    expect_identical(cl$env$mx$token, "tok")
+    chat_set_identity(cl, "corteza [opus]")
+    expect_identical(cl$env$mx$token, "rotated")
+})
+
+# And unconditionally, not only when the rename reported success. A
+# relogin whose retry then failed -- rate limit, transient 5xx -- still
+# rotated the token and still wrote it. Reloading only on success is how
+# the next send goes out on the token the homeserver already rejected.
+local({
+    dir <- tempfile("ident-")
+    dir.create(dir)
+    on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+    path <- file.path(dir, "matrix.json")
+    cfg <- chat_config(list(server = "https://ex.invalid", user = "bot",
+                            password = "pw", token = "tok",
+                            user_id = "@bot:ex", device_id = "DEV1"),
+                       path = path)
+    chat_config_save(cfg)
+
+    cl <- chat_matrix(mx = cfg, .sync = function(...) NULL,
+                      .extract = function(...) list(),
+                      .send = function(...) "$1", .media = function(...) NULL,
+                      .identity = function(client, name, ...) {
+                          on_disk <- chat_matrix_config(path = path)
+                          on_disk$token <- "rotated"
+                          chat_config_save(on_disk)
+                          stop("M_LIMIT_EXCEEDED")
+                      })
+    expect_error(chat_set_identity(cl, "x"), "M_LIMIT_EXCEEDED")
+    expect_identical(cl$env$mx$token, "rotated")
+})
+
+# Crypto state is committed before request transport. Failed requests remain
+# unsent and retryable; successful requests are marked only after transport;
+# cancellation failure is warning-only.
+local({
+    req_ok <- list(request_id = "ok", content = list(action = "request"))
+    req_fail <- list(request_id = "fail", content = list(action = "request"))
+    cancel <- list(request_id = "cancel",
+                   content = list(action = "request_cancellation"))
+    sessions <- list(key_requests = list(
+        a = c(req_ok, list(sent = FALSE)),
+        b = c(req_fail, list(sent = FALSE))))
+    res <- list(sessions = sessions, key_requests = list(req_ok, req_fail),
+                key_request_cancellations = list(cancel))
+    crypto <- new.env(parent = emptyenv())
+    crypto$sessions <- list()
+    crypto$store <- "unused"
+    ops <- character()
+    snapshots <- list()
+    save <- function(sessions, store) {
+        ops <<- c(ops, "save")
+        snapshots[[length(snapshots) + 1L]] <<- sessions
+        invisible(store)
+    }
+    send <- function(mx, requests) {
+        id <- requests[[1L]]$request_id
+        ops <<- c(ops, paste0("send:", id))
+        if (id %in% c("fail", "cancel")) stop("offline")
+        invisible(list())
+    }
+    mark <- function(sessions, requests) {
+        ids <- vapply(requests, `[[`, character(1), "request_id")
+        for (key in names(sessions$key_requests)) {
+            if (sessions$key_requests[[key]]$request_id %in% ids)
+                sessions$key_requests[[key]]$sent <- TRUE
+        }
+        sessions
+    }
+    warnings <- character()
+    withCallingHandlers(
+        chat.api:::matrix_crypto_commit_key_requests(
+            crypto, res, list(), .send = send, .mark = mark, .save = save),
+        warning = function(w) {
+            warnings <<- c(warnings, conditionMessage(w))
+            invokeRestart("muffleWarning")
+        })
+    expect_identical(ops,
+        c("save", "send:ok", "send:fail", "save", "send:cancel"))
+    expect_equal(length(snapshots), 2L)
+    expect_false(snapshots[[1L]]$key_requests$a$sent)
+    expect_true(snapshots[[2L]]$key_requests$a$sent)
+    expect_false(snapshots[[2L]]$key_requests$b$sent)
+    expect_true(crypto$sessions$key_requests$a$sent)
+    expect_false(crypto$sessions$key_requests$b$sent)
+    expect_equal(length(warnings), 2L)
+})
+
+# A post-send marker-save failure is warning-only. The first snapshot remains
+# safely retryable and the live state avoids an immediate duplicate.
+local({
+    request <- list(request_id = "ok", content = list(action = "request"))
+    sessions <- list(key_requests = list(
+        a = c(request, list(sent = FALSE))))
+    res <- list(sessions = sessions, key_requests = list(request),
+                key_request_cancellations = list())
+    crypto <- new.env(parent = emptyenv())
+    crypto$store <- "unused"
+    saves <- 0L
+    save <- function(...) {
+        saves <<- saves + 1L
+        if (saves == 2L) stop("disk full")
+    }
+    expect_warning(chat.api:::matrix_crypto_commit_key_requests(
+        crypto, res, list(), .send = function(...) NULL,
+        .mark = function(s, r) { s$key_requests$a$sent <- TRUE; s },
+        .save = save), "restart may safely retry")
+    expect_true(crypto$sessions$key_requests$a$sent)
+})
