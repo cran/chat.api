@@ -24,6 +24,7 @@ chat_matrix(
   .join = NULL,
   .create = NULL,
   .leave = NULL,
+  .invite = NULL,
   .state = NULL,
   .get_state = NULL,
   .extract_media = NULL,
@@ -34,7 +35,8 @@ chat_matrix(
   .read = NULL,
   .identity = NULL,
   .edit = NULL,
-  .rich = NULL
+  .rich = NULL,
+  .avatar = NULL
 )
 }
 \arguments{
@@ -84,10 +86,11 @@ before any poll publishes with the token it has -- the same exposure
 any direct send already carries, since \code{mx_with_relogin()}
 wraps only the sync. The sync cursor is held back until the crypto
 state is safe, on disk and on the client, so a sync carrying a room
-key is not marked consumed until that key is stored. And attachments
-are refused in encrypted rooms, because Matrix media uploads are not
-encrypted by this adapter -- \code{\link{chat_capabilities}} reports
-\code{files = FALSE} to match.}
+key is not marked consumed until that key is stored. Attachments use
+ciphertext uploads and encrypted file metadata with mx.client 0.3.0
+and mx.crypto 0.3.0 or later. Older dependencies refuse encrypted
+attachments before upload; \code{\link{chat_capabilities}} reports
+\code{files} according to the installed helpers.}
 
 \item{crypto_store}{Character or NULL. Directory holding the pickled
 Olm account and sessions. NULL derives it from \code{app} via
@@ -176,6 +179,9 @@ replacing \code{mx.api::mx_room_name} and
 \item{.leave}{Testing seam: replacement for
 \code{mx.api::mx_room_leave}. Leave NULL in production.}
 
+\item{.invite}{Testing seam: replacement for
+\code{mx.api::mx_room_invite}. Leave NULL in production.}
+
 \item{.state}{Testing seam: replacement for
 \code{mx.api::mx_set_state}. Leave NULL in production.}
 
@@ -212,6 +218,11 @@ the edit path. Leave NULL in production.}
 
 \item{.rich}{Testing seam: replacement for \code{mx.api::mx_send} on
 the rich-send path. Leave NULL in production.}
+
+\item{.avatar}{Testing seam: replacement for the upload-then-set
+pair behind \code{chat_set_identity(avatar =)}
+(\code{mx.api::mx_upload} and \code{mx_set_avatar_url}). Leave
+NULL in production.}
 }
 \value{
 A \code{chat_client} of class \code{chat_matrix}.

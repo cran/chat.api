@@ -23,14 +23,18 @@ A list with at least: \code{threads} (can post into
   (\code{\link{chat_whoami}} works, and with it the default
   \code{\link{chat_addressed}}), \code{channel_create}
   (\code{\link{chat_channel_create}} works), \code{leave}
-  (\code{\link{chat_leave}} works), \code{set_state}
+  (\code{\link{chat_leave}} works), \code{channel_invite}
+  (\code{\link{chat_channel_invite}} works), \code{set_state}
   (durable channel state: both \code{\link{chat_set_state}} and
   \code{\link{chat_get_state}} work -- a transport has the pair or
   neither), \code{files} (outbound:
   \code{chat_send(files =)} works), \code{attachments} (inbound:
   media comes back out of \code{\link{chat_poll}} as
   \code{\link{chat_attachment}} records), \code{typing},
-  \code{e2ee}, \code{identity_override} (logicals),
+  \code{e2ee},
+  \code{avatar} (\code{\link{chat_set_identity}} can set the
+  account's picture, not only its name),
+  \code{identity_override} (logicals),
   \code{user_identity} (a send can authenticate as a real member of
   the platform rather than as the bot -- Slack's
   \code{chat_send(as_user = TRUE)} with a user token; a property of

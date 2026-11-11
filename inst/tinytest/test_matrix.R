@@ -600,9 +600,9 @@ expect_null(enc$env$crypto)
 # The capability answers from the setting, not the context, so it does not
 # flip after the first poll.
 expect_true(chat_capabilities(enc)$e2ee)
-# ... and files is FALSE, because mx_send_media posts a cleartext m.file
-# event whatever the room's encryption state says.
-expect_false(chat_capabilities(enc)$files)
+# Files require the encrypted attachment helpers.
+expect_identical(chat_capabilities(enc)$files,
+                 chat.api:::matrix_attachment_crypto_available())
 # ... and so is threads: the encrypted send path has nowhere to put an
 # m.relates_to. A threaded send is refused rather than posted to the
 # room's main timeline, which is files' bargain and not rich's -- a
@@ -887,11 +887,11 @@ plain <- seam_client(.crypto = f$ops,
 expect_identical(chat_send(plain, "!unknown:ex", "hi"), "$clear1")
 expect_identical(cleartext$n, 1L)
 
-# ---- Attachments are refused in encrypted rooms ----
-# mx_send_media() posts an ordinary cleartext m.file event. The check used
-# to run after the upload loop, so the files reached the homeserver in the
-# clear and only the text took the Megolm path -- and an attachment-only
-# send never asked at all.
+# ---- Older dependencies refuse attachments before any upload ----
+local({
+available <- chat.api:::matrix_attachment_crypto_available
+assignInNamespace("matrix_attachment_crypto_available", function() FALSE, "chat.api")
+on.exit(assignInNamespace("matrix_attachment_crypto_available", available, "chat.api"))
 f <- fake_crypto()
 uploads <- new.env(parent = emptyenv()); uploads$n <- 0L
 enc <- seam_client(e2ee = TRUE, .crypto = f$ops,
@@ -912,6 +912,7 @@ expect_identical(uploads$n, 0L)
 ids <- chat_send(enc, "!plain:ex", "see these", files = c("/a.png", "/b.png"))
 expect_identical(ids, c("$ma.png", "$mb.png", "$id"))
 expect_identical(uploads$n, 2L)
+})
 
 # markup, kind, and mentions carry into the encrypted branch. Dropping
 # them would make an encrypted room silently lose formatting and pings
@@ -1492,6 +1493,27 @@ expect_error(chat_join(structure(list(), class = c("chat_nothing",
                                                    "chat_client")), "!a"),
              "not supported by this adapter")
 
+# ---- Inviting ----
+# The seam sees the room and the user, in mx_room_invite()'s order, and
+# the verb answers with the room.
+if (requireNamespace("mx.client", quietly = TRUE))
+local({
+    seen <- NULL
+    cl <- seam_client(.invite = function(session, room_id, user_id) {
+        seen <<- c(room_id, user_id)
+        "$ok"
+    })
+    expect_identical(chat_channel_invite(cl, "!a:ex", "@alice:ex"), "!a:ex")
+    expect_identical(seen, c("!a:ex", "@alice:ex"))
+})
+
+# A refused invitation propagates. Silently doing nothing would leave the
+# caller believing someone can see a room they cannot.
+if (requireNamespace("mx.client", quietly = TRUE))
+expect_error(chat_channel_invite(seam_client(.invite = function(...) {
+    stop("M_FORBIDDEN")
+}), "!a:ex", "@alice:ex"), "M_FORBIDDEN")
+
 # ---- Creating ----
 # The seam replaces mx.api::mx_room_create; adapter-specific options
 # (topic, visibility, invitees) ride through ... untouched.
@@ -1625,10 +1647,11 @@ local({
     expect_true(file.exists(dest))
 })
 
-# An encrypted attachment is refused rather than fetched: the bytes
-# behind the URL are ciphertext and this adapter cannot decrypt media,
-# so downloading would write a file that is not the picture.
+# Older dependencies refuse encrypted media before fetching ciphertext.
 local({
+    available <- chat.api:::matrix_attachment_crypto_available
+    assignInNamespace("matrix_attachment_crypto_available", function() FALSE, "chat.api")
+    on.exit(assignInNamespace("matrix_attachment_crypto_available", available, "chat.api"))
     cl <- seam_client(.download = function(...) stop("must not fetch"))
     enc_att <- chat_attachment(id = "mxc://ex/enc", name = "secret.png",
                                url = "mxc://ex/enc",
@@ -1659,7 +1682,7 @@ local({
                       e2ee = TRUE, .crypto = fake_crypto()$ops)
     caps <- chat_capabilities(cl)
     expect_true(caps$attachments)
-    expect_false(caps$files)
+    expect_identical(caps$files, chat.api:::matrix_attachment_crypto_available())
 })
 
 # ---- Threads ----
@@ -2098,12 +2121,36 @@ expect_error(chat_set_identity(structure(list(),
                                                    "chat_client")), "x"),
              "not supported by this adapter")
 
+# The picture goes through one seam standing for upload-then-set, and
+# the display name is left alone when only the picture was asked for.
+# Nothing asked for is FALSE; a refused upload propagates.
+local({
+    seen <- NULL
+    renamed <- FALSE
+    cl <- seam_client(.identity = function(client, name, ...) {
+        renamed <<- TRUE
+        TRUE
+    }, .avatar = function(mx, path) {
+        seen <<- path
+        "mxc://ex/abc"
+    })
+    expect_true(chat_set_identity(cl, avatar = "face.png"))
+    expect_identical(seen, "face.png")
+    expect_false(renamed)
+    expect_false(chat_set_identity(cl))
+})
+
+expect_error(chat_set_identity(seam_client(.avatar = function(...) {
+    stop("M_TOO_LARGE")
+}), avatar = "face.png"), "M_TOO_LARGE")
+
 local({
     caps <- chat_capabilities(seam_client())
     expect_true(caps$channels)
     expect_true(caps$history)
     expect_true(caps$mark_read)
     expect_true(caps$set_identity)
+    expect_true(caps$avatar)
     expect_true(caps$relogin)
     expect_identical(caps$pending, chat.api:::matrix_invites_available())
 })
@@ -2164,23 +2211,56 @@ local({
     expect_null(seen$`m.new_content`$format)
 })
 
-# An encrypted room refuses. The edit carries its replacement text in an
-# ordinary event, so sending one would put it on the homeserver in the
-# clear -- in the room whose whole point is that it is not.
+# An encrypted room edits through the Megolm path: the "* " fallback
+# body, the m.new_content and the relation all ride inside the
+# ciphertext, so the replacement text never reaches the homeserver in
+# the clear, and the plaintext edit transport is never touched.
 local({
     ctx <- new.env(parent = emptyenv())
+    seen <- NULL
     ops <- list(init = function(...) ctx,
                 encrypted = function(crypto, mx, room_id) TRUE,
-                send = function(...) "$enc",
+                send = function(crypto, mx, room_id, text, ...) {
+        seen <<- c(list(room_id = room_id, text = text), list(...))
+        "$enc"
+    },
                 decrypt = function(...) list())
     cl <- seam_client(mx = fake_mx(user_id = "@e2ee-edit:ex"),
                       .crypto = ops, e2ee = TRUE,
                       .edit = function(...) stop("must not be reached"))
-    expect_error(chat_edit(cl, "!secret:ex", "$orig", "shh"),
-                 "in the clear")
-    # And the capability says so up front, rather than letting a
-    # consumer find out by trying.
-    expect_false(chat_capabilities(cl)$edits)
+    expect_identical(chat_edit(cl, "!secret:ex", "$orig", "shh"), "$enc")
+    expect_identical(seen$room_id, "!secret:ex")
+    expect_identical(seen$text, "* shh")           # the fallback body
+    expect_identical(seen$extra[["m.new_content"]]$body, "shh")
+    expect_identical(seen$extra[["m.relates_to"]],
+                     list(rel_type = "m.replace", event_id = "$orig"))
+    # And the capability says so, so a consumer need not find out by trying.
+    expect_true(chat_capabilities(cl)$edits)
+})
+# A markdown edit in an encrypted room renders the fallback HTML once,
+# into extra, and sends the crypto body plain -- so the content builder
+# never re-renders "* text" and turns the asterisk into a bullet list.
+# Rendering markdown is mx.client's, so this runs only where it is installed.
+if (requireNamespace("mx.client", quietly = TRUE))
+local({
+    ctx <- new.env(parent = emptyenv())
+    seen <- NULL
+    ops <- list(init = function(...) ctx,
+                encrypted = function(crypto, mx, room_id) TRUE,
+                send = function(crypto, mx, room_id, text, markdown = FALSE, ...) {
+        seen <<- c(list(text = text, markdown = markdown), list(...))
+        "$enc"
+    },
+                decrypt = function(...) list())
+    cl <- seam_client(mx = fake_mx(user_id = "@e2ee-md:ex"),
+                      .crypto = ops, e2ee = TRUE)
+    chat_edit(cl, "!secret:ex", "$orig", "**done**", markup = "markdown")
+    expect_false(seen$markdown)                      # not re-rendered
+    expect_identical(seen$text, "* **done**")
+    expect_true(grepl("<strong>done</strong>", seen$extra$formatted_body))
+    expect_true(startsWith(seen$extra$formatted_body, "* "))
+    expect_true(grepl("<strong>done</strong>",
+                      seen$extra[["m.new_content"]]$formatted_body))
 })
 expect_true(chat_capabilities(seam_client())$edits)
 

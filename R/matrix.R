@@ -50,10 +50,11 @@
 #'   any direct send already carries, since \code{mx_with_relogin()}
 #'   wraps only the sync. The sync cursor is held back until the crypto
 #'   state is safe, on disk and on the client, so a sync carrying a room
-#'   key is not marked consumed until that key is stored. And attachments
-#'   are refused in encrypted rooms, because Matrix media uploads are not
-#'   encrypted by this adapter -- \code{\link{chat_capabilities}} reports
-#'   \code{files = FALSE} to match.
+#'   key is not marked consumed until that key is stored. Attachments use
+#'   ciphertext uploads and encrypted file metadata with mx.client 0.3.0
+#'   and mx.crypto 0.3.0 or later. Older dependencies refuse encrypted
+#'   attachments before upload; \code{\link{chat_capabilities}} reports
+#'   \code{files} according to the installed helpers.
 #' @param crypto_store Character or NULL. Directory holding the pickled
 #'   Olm account and sessions. NULL derives it from \code{app} via
 #'   \code{mx.client::mx_crypto_store_dir()}, with a per-device
@@ -127,6 +128,8 @@
 #'   \code{mx.api::mx_room_create}. Leave NULL in production.
 #' @param .leave Testing seam: replacement for
 #'   \code{mx.api::mx_room_leave}. Leave NULL in production.
+#' @param .invite Testing seam: replacement for
+#'   \code{mx.api::mx_room_invite}. Leave NULL in production.
 #' @param .state Testing seam: replacement for
 #'   \code{mx.api::mx_set_state}. Leave NULL in production.
 #' @param .get_state Testing seam: replacement for
@@ -149,6 +152,10 @@
 #'   \code{mx.api::mx_read_receipt}. Leave NULL in production.
 #' @param .identity Testing seam: replacement for
 #'   \code{mx.client::mx_set_displayname}. Leave NULL in production.
+#' @param .avatar Testing seam: replacement for the upload-then-set
+#'   pair behind \code{chat_set_identity(avatar =)}
+#'   (\code{mx.api::mx_upload} and \code{mx_set_avatar_url}). Leave
+#'   NULL in production.
 #' @param .rich Testing seam: replacement for \code{mx.api::mx_send} on
 #'   the rich-send path. Leave NULL in production.
 #' @param .edit Testing seam: replacement for \code{mx.api::mx_send} on
@@ -176,11 +183,12 @@ chat_matrix <- function(app = NULL, path = NULL, save_cursor = TRUE,
                         .send = NULL, .media = NULL, .typing = NULL,
                         .crypto = NULL, .save = NULL, .react = NULL,
                         .info = NULL, .members = NULL, .join = NULL,
-                        .create = NULL, .leave = NULL, .state = NULL,
+                        .create = NULL, .leave = NULL, .invite = NULL,
+                        .state = NULL,
                         .get_state = NULL, .extract_media = NULL,
                         .download = NULL, .channels = NULL, .history = NULL,
                         .pending = NULL, .read = NULL, .identity = NULL,
-                        .edit = NULL, .rich = NULL) {
+                        .edit = NULL, .rich = NULL, .avatar = NULL) {
     seams <- list(.sync, .extract, .send, .media)
     if ((is.null(mx) || any(vapply(seams, is.null, logical(1)))) &&
         !requireNamespace("mx.client", quietly = TRUE)) {
@@ -235,12 +243,14 @@ chat_matrix <- function(app = NULL, path = NULL, save_cursor = TRUE,
                    typing_fn = .typing, react_fn = .react,
                    info_fn = .info, members_fn = .members, join_fn = .join,
                    create_fn = .create, leave_fn = .leave,
+                   invite_fn = .invite,
                    state_fn = .state, get_state_fn = .get_state,
                    extract_media_fn = .extract_media,
                    download_fn = .download,
                    channels_fn = .channels, history_fn = .history,
                    pending_fn = .pending, read_fn = .read,
-                   identity_fn = .identity, edit_fn = .edit,
+                   identity_fn = .identity, avatar_fn = .avatar,
+                   edit_fn = .edit,
                    rich_fn = .rich,
                    crypto_ops = matrix_crypto_ops(.crypto)),
               class = c("chat_matrix", "chat_client"))
@@ -566,6 +576,13 @@ chat_poll.chat_matrix <- function(client, since = NULL, timeout = NULL, ...) {
     # owning crypto here: corteza used to run its own decrypt off $raw and
     # concatenate the results itself.
     for (d in dec) {
+        # Only messages. mx.client hands back every decrypted room event
+        # (a key, a ring notification, a reaction), and those have
+        # no body; a chat_message with an empty body is what a consumer
+        # trips over.
+        if (!is.character(d$body) || length(d$body) != 1L) {
+            next
+        }
         ms <- d$ts %||% event_ts[[as.character(d$event_id)]]
         messages[[length(messages) + 1L]] <- chat_message(
             id = as.character(d$event_id),
@@ -580,6 +597,7 @@ chat_poll.chat_matrix <- function(client, since = NULL, timeout = NULL, ...) {
             mentions = unlist(d$mentions, use.names = FALSE),
             encrypted = TRUE,
             sender_verified = isTRUE(d$sender_verified),
+            attachments = matrix_decrypted_attachments(d, res$client$user_id),
             raw = d)
     }
     # Inbound media. A picture is its own m.room.message event on
@@ -692,21 +710,22 @@ chat_send.chat_matrix <- function(client, channel, text,
              "so the reply would leave the thread. Check ",
              "chat_capabilities()$threads.", call. = FALSE)
     }
-    if (encrypted && !is.null(files)) {
-        # mx_send_media() posts an ordinary cleartext m.file event: the
-        # upload is not encrypted, and neither is the URL. There is no
-        # encrypted-attachment path to fall back to, so this refuses
-        # rather than leaking. chat_capabilities()$files reports FALSE on
-        # an e2ee client for the same reason.
+    if (encrypted && !is.null(files) && !matrix_attachment_crypto_available()) {
         stop("chat.api: cannot send attachments to the encrypted room ",
-             channel, ". Matrix media uploads are not encrypted by this ",
-             "adapter, and posting them would put the file on the ",
-             "homeserver in the clear.", call. = FALSE)
+             channel, "; install mx.client >= 0.3.0 and mx.crypto >= 0.3.0.",
+             call. = FALSE)
     }
     media_ids <- character()
     if (!is.null(files)) {
         for (f in files) {
-            event <- client$media_fn(client$env$mx, f, room = channel)
+            if (encrypted) {
+                content <- mx.client::mx_upload_encrypted(client$env$mx, f)
+                event <- client$crypto_ops$send(crypto, client$env$mx, channel,
+                    content$body, msgtype = content$msgtype,
+                    extra = content[c("file", "info")])
+            } else {
+                event <- client$media_fn(client$env$mx, f, room = channel)
+            }
             media_ids <- c(media_ids, as.character(event))
         }
     }
@@ -843,18 +862,25 @@ chat_leave.chat_matrix <- function(client, channel, ...) {
 }
 
 #' @export
+chat_channel_invite.chat_matrix <- function(client, channel, user, ...) {
+    # Errors propagate: an invitation that quietly failed leaves the
+    # caller believing someone can see a room they cannot.
+    sess <- mx.client::mx_client_session(client$env$mx)
+    invite_fn <- client$invite_fn %||% mx.api::mx_room_invite
+    invite_fn(sess, channel, user)
+    invisible(channel)
+}
+
+#' @export
 chat_download.chat_matrix <- function(client, attachment, dest = NULL, ...) {
     dest <- attachment_dest(attachment, dest)
-    # An encrypted attachment is refused rather than fetched. The bytes
-    # behind the mxc URL are ciphertext, and this adapter has no
-    # decryption path for media -- downloading them would hand the
-    # caller a file that is not the picture, with nothing to say so.
-    # The same bargain chat_send() makes refusing to upload into an
-    # encrypted room.
     if (isTRUE(attachment$raw$encrypted)) {
-        stop("chat.api: attachment ", attachment$id, " is encrypted, and ",
-             "this adapter cannot decrypt media. Fetching it would ",
-             "write ciphertext to ", dest, ".", call. = FALSE)
+        if (!matrix_attachment_crypto_available()) {
+            stop("chat.api: cannot decrypt media; install mx.client >= 0.3.0 ",
+                 "and mx.crypto >= 0.3.0", call. = FALSE)
+        }
+        return(mx.client::mx_download_encrypted(client$env$mx,
+                                                attachment$raw$file, dest))
     }
     url <- attachment$url
     if (!is.character(url) || length(url) != 1L || is.na(url) || !nzchar(url)) {
@@ -946,25 +972,23 @@ chat_capabilities.chat_matrix <- function(client, ...) {
     # because the context is built on first use, and a capability that
     # flipped after the first poll would be worse than either answer.
     #
-    # files is FALSE on an e2ee client. mx_send_media() posts a cleartext
-    # m.file event whatever the room's encryption state says, and this
-    # adapter has no encrypted-attachment path, so chat_send() refuses
-    # attachments to an encrypted room. TRUE would advertise something
-    # that fails in exactly the rooms such a client exists for.
+    # Encrypted files require both the attachment primitive and upload
+    # helper. Older optional packages retain the fail-closed refusal.
     list(threads = matrix_threads_available() && !isTRUE(client$e2ee),
          thread_replies = TRUE,
-         # Refused in encrypted rooms: an edit carries its replacement
-         # text in an ordinary event, and there is no Megolm path that
-         # can carry a relation. Same bargain as files.
-         edits = !isTRUE(client$e2ee),
+         # An edit works encrypted too: the Megolm path carries the
+         # relation and m.new_content inside the ciphertext, so the
+         # replacement text stays off the homeserver.
+         edits = TRUE,
          reactions = TRUE, reaction_events = matrix_reactions_available(),
          channel_info = TRUE, members = TRUE,
          invites = matrix_invites_available(), join = TRUE, whoami = TRUE,
          channels = TRUE, history = TRUE,
          pending = matrix_invites_available(), mark_read = TRUE,
-         set_identity = TRUE, relogin = TRUE,
-         channel_create = TRUE, leave = TRUE, set_state = TRUE,
-         files = !isTRUE(client$e2ee),
+         set_identity = TRUE, avatar = TRUE, relogin = TRUE,
+         channel_create = TRUE, leave = TRUE, channel_invite = TRUE,
+         set_state = TRUE,
+         files = !isTRUE(client$e2ee) || matrix_attachment_crypto_available(),
          # attachments tracks the installed mx.client, the way
          # reaction_events does: mx_extract_media_events() arrived in
          # 0.2.0.6, and on an older build the poll has no source for
@@ -972,11 +996,8 @@ chat_capabilities.chat_matrix <- function(client, ...) {
          # media messages come back out of chat_poll(), and
          # chat_download() fetches their bytes.
          #
-         # TRUE on an e2ee client too, unlike outbound files. The
-         # events are reported either way; what an encrypted
-         # attachment cannot do is be fetched, and chat_download()
-         # refuses that one rather than the whole room's media going
-         # unmentioned.
+         # Events remain visible with older dependencies; fetching encrypted
+         # bytes requires matrix_attachment_crypto_available().
          attachments = matrix_media_capable(client),
          typing = TRUE, e2ee = isTRUE(client$e2ee),
          identity_override = FALSE, user_identity = FALSE,
@@ -1168,39 +1189,19 @@ chat_edit.chat_matrix <- function(client, channel, message_id, text,
                                   markup = c("plain", "markdown"),
                                   rich = NULL, kind = "message", ...) {
     markup <- match.arg(markup)
-    # Refused in encrypted rooms, and chat_capabilities() reports
-    # edits = FALSE on an e2ee client to match -- the same bargain
-    # attachments get.
-    #
-    # An edit is an ordinary m.room.message carrying m.new_content, so
-    # sending one the plain way puts the replacement text on the
-    # homeserver in the clear, in a room whose whole point is that it is
-    # not. The Megolm path cannot carry it either: crypto_ops$send()
-    # takes text, msgtype, markdown and mentions, and there is nowhere in
-    # that shape to put a relation.
-    crypto <- matrix_crypto_require(client)
-    if (!is.null(crypto) &&
-        client$crypto_ops$encrypted(crypto, client$env$mx, channel)) {
-        stop("chat.api: cannot edit a message in the encrypted room ",
-             channel, ". An edit carries the replacement text in an ",
-             "ordinary event, and posting one would put it on the ",
-             "homeserver in the clear.", call. = FALSE)
-    }
-    sess <- mx.client::mx_client_session(client$env$mx)
-    fn <- client$edit_fn %||% mx.api::mx_send
+    msgtype <- matrix_msgtype(kind)
     html <- if (identical(markup, "markdown")) {
         mx.client::mx_markdown_to_html(text)
     } else {
         NULL
     }
-    msgtype <- matrix_msgtype(kind)
-    new_content <- list(msgtype = msgtype, body = text)
     # A supplied fragment wins over one rendered from markdown: the
     # caller has markup the renderer cannot express, which is the only
     # reason to pass one.
     if (!is.null(rich)) {
         html <- rich
     }
+    new_content <- list(msgtype = msgtype, body = text)
     if (!is.null(html)) {
         new_content$format <- "org.matrix.custom.html"
         new_content$formatted_body <- html
@@ -1215,6 +1216,23 @@ chat_edit.chat_matrix <- function(client, channel, message_id, text,
         # it is a correction rather than the bot repeating itself.
         extra$formatted_body <- paste0("* ", html)
     }
+    # In an encrypted room the whole event -- the "* " fallback body, the
+    # m.new_content and the relation -- is encrypted with Megolm, so the
+    # replacement text never reaches the homeserver in the clear. The
+    # crypto send path carries the relation as extra content.
+    crypto <- matrix_crypto_require(client)
+    if (!is.null(crypto) &&
+        client$crypto_ops$encrypted(crypto, client$env$mx, channel)) {
+        # markdown = FALSE: the fallback's formatted_body is already in
+        # `extra` ("* " + html), so letting the content builder render
+        # "* text" again would turn the asterisk into a bullet list.
+        event <- client$crypto_ops$send(crypto, client$env$mx, channel,
+            paste0("* ", text), msgtype = msgtype, markdown = FALSE,
+            extra = extra)
+        return(invisible(as.character(event)))
+    }
+    sess <- mx.client::mx_client_session(client$env$mx)
+    fn <- client$edit_fn %||% mx.api::mx_send
     invisible(as.character(fn(sess, channel, paste0("* ", text),
                               msgtype = msgtype, extra = extra)))
 }

@@ -134,14 +134,18 @@ chat_resolve <- function(client, name, ...) {
 #'   (\code{\link{chat_whoami}} works, and with it the default
 #'   \code{\link{chat_addressed}}), \code{channel_create}
 #'   (\code{\link{chat_channel_create}} works), \code{leave}
-#'   (\code{\link{chat_leave}} works), \code{set_state}
+#'   (\code{\link{chat_leave}} works), \code{channel_invite}
+#'   (\code{\link{chat_channel_invite}} works), \code{set_state}
 #'   (durable channel state: both \code{\link{chat_set_state}} and
 #'   \code{\link{chat_get_state}} work -- a transport has the pair or
 #'   neither), \code{files} (outbound:
 #'   \code{chat_send(files =)} works), \code{attachments} (inbound:
 #'   media comes back out of \code{\link{chat_poll}} as
 #'   \code{\link{chat_attachment}} records), \code{typing},
-#'   \code{e2ee}, \code{identity_override} (logicals),
+#'   \code{e2ee},
+#'   \code{avatar} (\code{\link{chat_set_identity}} can set the
+#'   account's picture, not only its name),
+#'   \code{identity_override} (logicals),
 #'   \code{user_identity} (a send can authenticate as a real member of
 #'   the platform rather than as the bot -- Slack's
 #'   \code{chat_send(as_user = TRUE)} with a user token; a property of
@@ -300,6 +304,40 @@ chat_leave.default <- function(client, channel, ...) {
     stop("chat_leave() is not supported by this adapter (",
          paste(class(client), collapse = "/"),
          "). Check chat_capabilities()$leave.", call. = FALSE)
+}
+
+#' Invite a user to a channel
+#'
+#' The other side of an invitation: \code{\link{chat_poll}} reports the
+#' ones this client receives, and this verb issues one. A bot that files
+#' rooms for people needs it about as often as it needs
+#' \code{\link{chat_channel_create}}, because a room nobody but the bot
+#' can enter does not exist for anyone else. Capability-gated: check
+#' \code{chat_capabilities()$channel_invite}.
+#'
+#' The default method throws, on \code{\link{chat_join}}'s reasoning: an
+#' invitation that silently did not go out leaves the caller believing
+#' someone can see a room they cannot.
+#'
+#' @param client A \code{chat_client}.
+#' @param channel Channel/room identifier.
+#' @param user The invitee's platform identifier, such as a Matrix user
+#'   id (\code{"@alice:example.org"}).
+#' @param ... Adapter-specific options.
+#' @return The channel identifier, invisibly.
+#' @examples
+#' cl <- chat_loopback()
+#' chat_channel_invite(cl, "general", "@alice:example.org")
+#' @export
+chat_channel_invite <- function(client, channel, user, ...) {
+    UseMethod("chat_channel_invite")
+}
+
+#' @export
+chat_channel_invite.default <- function(client, channel, user, ...) {
+    stop("chat_channel_invite() is not supported by this adapter (",
+         paste(class(client), collapse = "/"),
+         "). Check chat_capabilities()$channel_invite.", call. = FALSE)
 }
 
 #' Construct a normalized invitation record
@@ -963,8 +1001,9 @@ chat_mark_read.default <- function(client, channel, message_id, ...) {
 
 #' Set this client's persistent identity
 #'
-#' The account's own display name, as everyone in every channel sees it
-#' until it is changed again. Distinct from \code{\link{chat_send}}'s
+#' The account's own display name and, where the platform lets a bot
+#' set one, its picture, as everyone in every channel sees them until
+#' they are changed again. Distinct from \code{\link{chat_send}}'s
 #' \code{identity} argument, which decorates a single message on
 #' platforms that allow it.
 #'
@@ -977,22 +1016,31 @@ chat_mark_read.default <- function(client, channel, message_id, ...) {
 #' has to know it happened.
 #'
 #' @param client A \code{chat_client}.
-#' @param display New display name.
+#' @param display New display name, or NULL to leave it as it is.
+#' @param avatar Path to an image file for the account's picture, or
+#'   NULL to leave it. Set where the platform lets a bot change its own
+#'   picture: Matrix uploads the file and points the profile at it. An
+#'   adapter whose platform sets a bot's picture outside its API
+#'   ignores it, on \code{\link{chat_typing}}'s reasoning, and answers
+#'   FALSE when it was all that was asked for.
 #' @param ... Adapter-specific options.
-#' @return TRUE if the identity was changed, invisibly.
+#' @return TRUE if the identity was changed, invisibly; FALSE when
+#'   nothing was asked for that the adapter can set.
 #' @examples
 #' \dontrun{
 #' # Requires a saved Matrix configuration and account credentials.
 #' cl <- chat_matrix(app = "mybot")
 #' chat_set_identity(cl, "Example Bot")
+#' chat_set_identity(cl, avatar = "face.png")
 #' }
 #' @export
-chat_set_identity <- function(client, display, ...) {
+chat_set_identity <- function(client, display = NULL, avatar = NULL, ...) {
     UseMethod("chat_set_identity")
 }
 
 #' @export
-chat_set_identity.default <- function(client, display, ...) {
+chat_set_identity.default <- function(client, display = NULL, avatar = NULL,
+                                      ...) {
     stop("chat_set_identity() is not supported by this adapter (",
          paste(class(client), collapse = "/"),
          "). Check chat_capabilities()$set_identity.", call. = FALSE)
